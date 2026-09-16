@@ -1,0 +1,17 @@
+{
+  "name": "janitor-gemini-guest-proxy",
+  "version": "1.0.0",
+  "description": "Localhost Gemini Reverse Proxy for JanitorAI with Guest Account Cycling",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "gemini-web-sdk": "^2.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
