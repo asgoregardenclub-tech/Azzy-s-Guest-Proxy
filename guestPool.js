@@ -232,4 +232,3 @@ class GuestPool {
 }
 
 module.exports = GuestPool;
-EOF
