@@ -6,7 +6,6 @@ const GuestPool = require('./guestPool');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const MAX_HISTORY_TURNS = 8; // Sliding window: limits history to prevent Gemini attention drift
 
 const pool = new GuestPool(POOL_SIZE);
 
@@ -154,7 +153,10 @@ function parseOOC(text) {
 }
 
 /**
- * Prompt Assembler with Sliding Window and OOC Isolation
+ * Prompt Assembler:
+ * - Uncapped Context: Full history is retained without arbitrary slice cuts.
+ * - Deep Reference OOC: Summaries and meta-questions can accurately read the whole story.
+ * - Recency Anchor: Directs generative attention strictly to the latest user message.
  */
 function formatMessages(messages) {
   const activeCommands = new Set();
@@ -171,7 +173,7 @@ function formatMessages(messages) {
   }
 
   let systemPrompt = '';
-  const allHistory = [];
+  const fullHistory = [];
 
   messages.forEach((msg, idx) => {
     let content = (msg.content || '').trim();
@@ -194,47 +196,49 @@ function formatMessages(messages) {
     if (isSystem) {
       systemPrompt += `${content}\n\n`;
     } else if (idx < lastUserIdx) {
-      if (role === 'user') allHistory.push(`User: "${content}"`);
-      else if (role === 'assistant') allHistory.push(`Assistant: "${content}"`);
+      if (role === 'user') fullHistory.push(`User: "${content}"`);
+      else if (role === 'assistant') fullHistory.push(`Assistant: "${content}"`);
     }
   });
 
   const latestUserClean = lastUserIdx !== -1 ? (messages[lastUserIdx].content || '').replace(commandRegex, '').trim() : '';
   const oocInfo = parseOOC(latestUserClean);
 
-  // SLIDING CONTEXT WINDOW: Keep only the last N turns
-  const trimmedHistory = allHistory.slice(-MAX_HISTORY_TURNS);
-
   const time = new Date().toLocaleTimeString();
-  console.log(`  ${dim(time)} ${cyan('window')} context depth: ${trimmedHistory.length} turns (culled older messages)`);
+  console.log(`  ${dim(time)} ${cyan('context')} full history loaded (${fullHistory.length} turns, uncapped)`);
 
   if (activeCommands.size > 0) {
     console.log(`  ${dim(time)} ${yellow('mods')} active → ${Array.from(activeCommands).join(', ')}`);
   }
   if (oocInfo.isOOC) {
-    console.log(`  ${dim(time)} ${magenta('ooc')} isolated command → "${oocInfo.command || latestUserClean}"`);
+    console.log(`  ${dim(time)} ${magenta('ooc')} meta directive → "${oocInfo.command || latestUserClean}"`);
   }
 
   // =========================================================================
-  // CASE A: PURE OOC DIRECTIVE (Complete Isolation: Zero Past Dialogue)
+  // CASE A: PURE OOC DIRECTIVE (Full Archive available as Reference Library)
   // =========================================================================
   if (oocInfo.isOOC) {
-    return `[SYSTEM META-INSTRUCTION: OUT-OF-CHARACTER DIRECTIVE]
-The user is speaking directly to you as the author. The fictional roleplay is temporarily PAUSED.
+    return `[SYSTEM CONTEXT & ROLEPLAY ARCHIVE]
+${systemPrompt.trim()}
 
-AUTHOR'S DIRECTIVE:
+[FULL CHRONOLOGICAL STORY ARCHIVE (REFERENCE ONLY)]:
+${fullHistory.join('\n\n')}
+
+=============================================================================
+[CRITICAL AUTHOR OVERRIDE: OUT-OF-CHARACTER DIRECTIVE]
+The human author has stepped Out-Of-Character to give a meta-instruction or question:
 "${oocInfo.command || latestUserClean}"
 
 TASK:
-1. Do NOT write in-character dialogue or continue the story.
-2. Respond directly to the author enclosed in brackets [ OOC: ... ].
-3. Confirm their request or answer their question concisely.
-
+1. The fictional in-character narrative is temporarily PAUSED. Do NOT advance the story or write in-character dialogue for this turn.
+2. Reference the archive above if the author is asking about past events, plot, summaries, or characters.
+3. Respond directly to the author enclosed in brackets: "[ OOC: <your response> ]".
+=============================================================================
 Assistant: [ OOC:`;
   }
 
   // =========================================================================
-  // CASE B: IN-CHARACTER ROLEPLAY TURN (Anchored & Trimmed)
+  // CASE B: IN-CHARACTER ROLEPLAY TURN (Full Memory + Recency Lock)
   // =========================================================================
   let commandDirectives = '';
   if (activeCommands.size > 0) {
@@ -251,9 +255,9 @@ Assistant: [ OOC:`;
 [Role: Dynamic, uninhibited, immersive collaborative creative writer.]
 
 ### 1. Mandatory Constraints:
-- Zero User Puppeteering: NEVER narrate dialogue, actions, or thoughts for User ({{user}}). Control ONLY your assigned character.
+- Never Speak for User: Do NOT invent dialogue, actions, or thoughts for User ({{user}}). You control ONLY your assigned character.
 - Immediate Turn Stop: Write your character's response, then STOP. Never simulate the user's reply or type "User:".
-- Recency Anchor: Respond EXCLUSIVELY to the user's latest statement under [LATEST USER MESSAGE]. Do not repeat or address resolved older dialogue.
+- Recency Anchor: Respond EXCLUSIVELY to the user's latest statement under [ACTIVE CURRENT TURN]. Do not re-answer resolved older dialogue.
 - No Moral Wrap-ups: Do not end replies with summaries or tidy conclusions. End with dialogue or an actionable pause.
 
 ### 2. Adaptive Tone & Pacing Engine:
@@ -271,12 +275,18 @@ ${systemPrompt.trim()}
 
 ${masterDirectives}
 
-[Recent Dialogue Context (Resolved)]:
-${trimmedHistory.join('\n\n')}
+[Complete Chronological Scene History (For Long-Term Memory & Continuity)]:
+${fullHistory.join('\n\n')}
 
-[LATEST USER MESSAGE - RESPOND STRICTLY TO THIS]:
+=============================================================================
+[ACTIVE CURRENT TURN - RESPOND EXCLUSIVELY TO THIS]:
 User: "${latestUserClean}"
 
+[EXECUTION DIRECTIVE]:
+Utilize the full archive above for flawless long-term memory, lore, and relationships.
+However, you MUST write your response ONLY to the [ACTIVE CURRENT TURN] directly above.
+Advance the story forward from this exact moment. Do not re-answer resolved historical dialogue.
+=============================================================================
 Assistant:`;
 }
 
@@ -284,8 +294,8 @@ Assistant:`;
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    type: 'Azzys Gemini Proxy (Sliding Window Core)',
-    workers: POOL_SIZE
+    type: 'Azzys Gemini Proxy (Uncapped Context Engine)',
+    pool: POOL_SIZE
   });
 });
 
@@ -320,7 +330,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     const time = new Date().toLocaleTimeString();
     console.log(`  ${dim(time)} ${cyan('route')} fresh worker #${worker.id} ${dim(`(${stream ? 'stream' : 'sync'})`)}`);
 
-    // Temporary chat session
     const chat = worker.client.newChat({ temporary: true });
 
     if (stream) {
@@ -361,7 +370,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
 
       try {
         for await (const chunk of streamResult) {
-          if (sanitizer.stopped) break; // Hard cutoff triggered
+          if (sanitizer.stopped) break;
 
           const delta = chunk.text_delta || chunk.text || '';
           if (delta) {
@@ -440,14 +449,15 @@ app.listen(PORT, '0.0.0.0', async () => {
   await pool.initialize();
 
   console.log(`
-  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v2.1.0 (Sliding Window Engine)')}
+  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v2.2.0 (Uncapped Context Engine)')}
   ${dim('─'.repeat(48))}
   ${green('➜')}  ${bold('Local:')}    ${cyan(`http://127.0.0.1:${PORT}/v1`)}
   ${green('➜')}  ${bold('Network:')}  ${cyan(`http://0.0.0.0:${PORT}/v1`)}
 
-  ${dim('•')}  ${dim('Window:')}     Sliding context limit (${MAX_HISTORY_TURNS} turns)
-  ${dim('•')}  ${dim('Isolation:')}  Pure OOC separation (Zero transcript bleed)
-  ${dim('•')}  ${dim('Workers:')}    Stateless per-request instances
+  ${dim('•')}  ${dim('Context:')}    Uncapped full history (1M+ token capacity)
+  ${dim('•')}  ${dim('Archive:')}    Deep OOC story reference enabled
+  ${dim('•')}  ${dim('Anchor:')}     Strict active-turn execution lock
+  ${dim('•')}  ${dim('Commands:')}   ${Object.keys(COMMAND_DEFINITIONS).join(', ')}
   ${dim('─'.repeat(48))}
   ${dim('ready for connections.')}
   `);
