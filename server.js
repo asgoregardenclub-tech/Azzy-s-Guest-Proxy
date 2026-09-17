@@ -176,7 +176,6 @@ class StreamSanitizer {
     }
 
     if (safeChunk) {
-      // NOTE: Preserves trailing whitespace between stream chunks!
       const cleaned = cleanArtifacts(safeChunk, false);
       if (cleaned) this.onSafeChunk(cleaned);
     }
@@ -210,10 +209,7 @@ function parseOOC(text) {
 }
 
 /**
- * Prompt Assembler:
- * - Uncapped Context: Full history is retained without arbitrary slice cuts.
- * - Deep Reference OOC: Summaries and meta-questions can accurately read the whole story.
- * - Recency Anchor: Directs generative attention strictly to the latest user message.
+ * Prompt Assembler
  */
 function formatMessages(messages) {
   const activeCommands = new Set();
@@ -387,7 +383,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     });
   }
 
-  // Link client connection drop to AbortController
   const abortController = new AbortController();
   req.on('close', () => {
     if (!res.writableEnded) {
@@ -413,7 +408,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
 
-      // Initial chunk: role definition
       res.write(`data: ${JSON.stringify({
         id: completionId,
         object: 'chat.completion.chunk',
