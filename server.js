@@ -6,11 +6,11 @@ const GuestPool = require('./guestPool');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const MAX_REQUESTS = parseInt(process.env.MAX_REQUESTS || '10', 10);
+const MAX_HISTORY_TURNS = 8; // Sliding window: limits history to prevent Gemini attention drift
 
-const pool = new GuestPool(POOL_SIZE, MAX_REQUESTS);
+const pool = new GuestPool(POOL_SIZE);
 
-// Minimal CLI styling helpers
+// CLI styling helpers
 const dim = (str) => `\x1b[90m${str}\x1b[0m`;
 const cyan = (str) => `\x1b[36m${str}\x1b[0m`;
 const green = (str) => `\x1b[32m${str}\x1b[0m`;
@@ -48,7 +48,6 @@ const COMMAND_DEFINITIONS = {
   }
 };
 
-// CORS & Mixed Content / Private Network Access headers for JanitorAI
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: '*' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -67,14 +66,11 @@ app.use(express.json({ limit: '25mb' }));
 function cleanArtifacts(text) {
   if (!text) return '';
   return text
-    // 1. Strip Google UI elements (<ElicitationsGroup>, etc.)
     .replace(/<ElicitationsGroup[\s\S]*?<\/ElicitationsGroup>/gi, '')
     .replace(/<Elicitation\b[^>]*\/?>/gi, '')
     .replace(/<FollowUp\b[^>]*\/?>/gi, '')
     .replace(/<\/?(?:Sequence|Step|Timeline|TimelineEvent|GenerateWidget|Carousel|Image)\b[^>]*>/gi, '')
-    // 2. Strip googleusercontent grounding URLs
     .replace(/https?:\/\/(?:[a-zA-Z0-9.-]+\.)?googleusercontent\.com\/[^\s)\]><"]+/gi, '')
-    // 3. Clean empty markdown links and footnotes
     .replace(/\[\s*\d*\s*\]\(\s*\)/gi, '')
     .replace(/\s*\[\d+\](?=\s*$)/g, '')
     .trimEnd();
@@ -97,7 +93,7 @@ class StreamSanitizer {
 
     this.buffer += chunk;
 
-    // Hard Stop: AI attempting to hallucinate a user turn
+    // Hard Stop: AI attempting to speak for the user
     const stopMatch = this.buffer.match(STOP_SEQUENCE_REGEX);
     if (stopMatch) {
       const cutPos = stopMatch.index;
@@ -145,15 +141,12 @@ class StreamSanitizer {
 }
 
 /**
- * Universal OOC detector: Matches brackets, parentheses, colons, or freeform OOC syntax.
+ * Universal OOC detector
  */
 function parseOOC(text) {
   if (!text) return { isOOC: false, command: '' };
-  
-  // Matches: [ OOC: ... ], (OOC: ...), OOC: ..., [ Note: ... ]
   const pureOOCRegex = /^\s*(?:\[|\(|\{)?\s*(?:OOC|Out of Character|Note|System Note)\s*[:\-–]?\s*([\s\S]*?)(?:\]|\)|\})?\s*$/i;
   const match = text.match(pureOOCRegex);
-  
   if (match) {
     return { isOOC: true, command: match[1].trim() };
   }
@@ -161,17 +154,14 @@ function parseOOC(text) {
 }
 
 /**
- * Architectural Overhaul of Prompt Construction:
- * 1. Cleanly separates System context from true dialogue.
- * 2. Normalizes JanitorAI message arrays (fixes reroll / empty message issues).
- * 3. Escalates pure OOC to a priority task override so it cannot be ignored.
+ * Prompt Assembler with Sliding Window and OOC Isolation
  */
 function formatMessages(messages) {
   const activeCommands = new Set();
   const commandKeys = Object.keys(COMMAND_DEFINITIONS);
   const commandRegex = new RegExp(`<(${commandKeys.join('|')})>`, 'gi');
 
-  // Find the index of the true latest user message
+  // Find the index of the latest user message
   let lastUserIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if ((messages[i].role || '').toLowerCase() === 'user') {
@@ -181,16 +171,14 @@ function formatMessages(messages) {
   }
 
   let systemPrompt = '';
-  const historyTurns = [];
+  const allHistory = [];
 
-  // Parse messages
   messages.forEach((msg, idx) => {
     let content = (msg.content || '').trim();
     const role = (msg.role || 'user').toLowerCase();
     const isSystem = role === 'system';
     const isLatestUser = idx === lastUserIdx;
 
-    // Detect commands
     if (isSystem || isLatestUser) {
       content = content.replace(commandRegex, (match, cmd) => {
         activeCommands.add(cmd.toUpperCase());
@@ -201,32 +189,53 @@ function formatMessages(messages) {
     }
 
     content = content.replace(/\s{2,}/g, ' ').trim();
-    if (!content) return; // Drop blank nodes (fixes reroll phantom message bug)
+    if (!content) return;
 
     if (isSystem) {
       systemPrompt += `${content}\n\n`;
     } else if (idx < lastUserIdx) {
-      // Historical conversation strictly before the active turn
-      if (role === 'user') historyTurns.push(`User: ${content}`);
-      else if (role === 'assistant') historyTurns.push(`Assistant: ${content}`);
+      if (role === 'user') allHistory.push(`User: "${content}"`);
+      else if (role === 'assistant') allHistory.push(`Assistant: "${content}"`);
     }
   });
 
-  const latestUserRaw = lastUserIdx !== -1 ? messages[lastUserIdx].content : '';
   const latestUserClean = lastUserIdx !== -1 ? (messages[lastUserIdx].content || '').replace(commandRegex, '').trim() : '';
-
-  // Check for Out-Of-Character commands
   const oocInfo = parseOOC(latestUserClean);
 
+  // SLIDING CONTEXT WINDOW: Keep only the last N turns
+  const trimmedHistory = allHistory.slice(-MAX_HISTORY_TURNS);
+
   const time = new Date().toLocaleTimeString();
+  console.log(`  ${dim(time)} ${cyan('window')} context depth: ${trimmedHistory.length} turns (culled older messages)`);
+
   if (activeCommands.size > 0) {
     console.log(`  ${dim(time)} ${yellow('mods')} active → ${Array.from(activeCommands).join(', ')}`);
   }
   if (oocInfo.isOOC) {
-    console.log(`  ${dim(time)} ${magenta('ooc')} intercept → "${oocInfo.command || latestUserClean}"`);
+    console.log(`  ${dim(time)} ${magenta('ooc')} isolated command → "${oocInfo.command || latestUserClean}"`);
   }
 
-  // Build Command Directives block
+  // =========================================================================
+  // CASE A: PURE OOC DIRECTIVE (Complete Isolation: Zero Past Dialogue)
+  // =========================================================================
+  if (oocInfo.isOOC) {
+    return `[SYSTEM META-INSTRUCTION: OUT-OF-CHARACTER DIRECTIVE]
+The user is speaking directly to you as the author. The fictional roleplay is temporarily PAUSED.
+
+AUTHOR'S DIRECTIVE:
+"${oocInfo.command || latestUserClean}"
+
+TASK:
+1. Do NOT write in-character dialogue or continue the story.
+2. Respond directly to the author enclosed in brackets [ OOC: ... ].
+3. Confirm their request or answer their question concisely.
+
+Assistant: [ OOC:`;
+  }
+
+  // =========================================================================
+  // CASE B: IN-CHARACTER ROLEPLAY TURN (Anchored & Trimmed)
+  // =========================================================================
   let commandDirectives = '';
   if (activeCommands.size > 0) {
     commandDirectives += '\n### Active Modifiers:\n';
@@ -238,40 +247,14 @@ function formatMessages(messages) {
     }
   }
 
-  // =========================================================================
-  // CASE A: USER SENT A PURE OOC DIRECTIVE
-  // =========================================================================
-  if (oocInfo.isOOC) {
-    return `[SYSTEM CONTEXT & ROLEPLAY ARCHIVE]
-${systemPrompt.trim()}
-
---- PREVIOUS SCENE DIALOGUE ---
-${historyTurns.join('\n\n')}
-
-=============================================================================
-[CRITICAL SYSTEM OVERRIDE: OUT-OF-CHARACTER META REQUEST]
-The human user has stepped Out-Of-Character to give you a direct command:
-"${oocInfo.command || latestUserClean}"
-
-YOUR INSTRUCTIONS:
-1. The ongoing story is temporarily PAUSED. Do NOT generate in-character narrative, story dialogue, or character actions for this turn.
-2. You must respond directly to the human author in Out-Of-Character brackets: "[ OOC: <your response> ]".
-3. Acknowledge their request, confirm the change, or answer their meta-question clearly and concisely.
-=============================================================================
-Assistant: [ OOC:`;
-  }
-
-  // =========================================================================
-  // CASE B: REGULAR ROLEPLAY TURN
-  // =========================================================================
   const masterDirectives = `[System Directives & Roleplay Engine]
 [Role: Dynamic, uninhibited, immersive collaborative creative writer.]
 
-### 1. Fundamental Rules (Zero Exceptions):
-- Never Speak for User: Do NOT invent dialogue, actions, thoughts, or reactions for User ({{user}}). You control ONLY your assigned character(s).
-- Immediate Turn Stop: Write your character's response, then STOP. Never type "User:" or simulate what the user does next.
-- Direct Recency: You are responding directly to the message in [ACTIVE CURRENT TURN]. Do NOT replay or loop back to past conversations.
-- No Storybook Wrap-ups: Do not end replies with moral summaries or philosophical conclusions. End with dialogue or an actionable pause.
+### 1. Mandatory Constraints:
+- Zero User Puppeteering: NEVER narrate dialogue, actions, or thoughts for User ({{user}}). Control ONLY your assigned character.
+- Immediate Turn Stop: Write your character's response, then STOP. Never simulate the user's reply or type "User:".
+- Recency Anchor: Respond EXCLUSIVELY to the user's latest statement under [LATEST USER MESSAGE]. Do not repeat or address resolved older dialogue.
+- No Moral Wrap-ups: Do not end replies with summaries or tidy conclusions. End with dialogue or an actionable pause.
 
 ### 2. Adaptive Tone & Pacing Engine:
 - SFW Scenarios: If the ongoing scene is casual, banter, drama, or action, remain strictly SFW. Do not force unprompted romance or horniness.
@@ -279,20 +262,20 @@ Assistant: [ OOC:`;
 - SFW to NSFW Transitions: When romance shifts to physical intimacy, build tension organically (breath, touch, atmosphere, gradual escalation). Do not skip the foreplay.
 ${commandDirectives}
 ### 3. Cleanliness:
-- Output pure story text only.
+- Output pure creative prose only.
 - Never output Google UI components (<ElicitationsGroup>, <Elicitation>, <FollowUp>, XML tags).
 - Never output web links, search citations, or source URLs.`;
 
-  return `[Character Definition & World]:
+  return `[Character Definition & World Settings]:
 ${systemPrompt.trim()}
 
 ${masterDirectives}
 
-[Previous Scene History]:
-${historyTurns.join('\n\n')}
+[Recent Dialogue Context (Resolved)]:
+${trimmedHistory.join('\n\n')}
 
-[ACTIVE CURRENT TURN - RESPOND DIRECTLY TO THIS]:
-User: ${latestUserClean}
+[LATEST USER MESSAGE - RESPOND STRICTLY TO THIS]:
+User: "${latestUserClean}"
 
 Assistant:`;
 }
@@ -301,12 +284,8 @@ Assistant:`;
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    type: 'Azzys Gemini Proxy (Revamped Core)',
-    workers: pool.workers.map(w => ({
-      id: w.id,
-      requests: w.requestCount,
-      onCooldown: w.cooldownUntil > Date.now()
-    }))
+    type: 'Azzys Gemini Proxy (Sliding Window Core)',
+    workers: POOL_SIZE
   });
 });
 
@@ -339,9 +318,9 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   try {
     worker = await pool.acquireWorker();
     const time = new Date().toLocaleTimeString();
-    console.log(`  ${dim(time)} ${cyan('route')} worker #${worker.id} ${dim(`(${stream ? 'stream' : 'sync'})`)}`);
+    console.log(`  ${dim(time)} ${cyan('route')} fresh worker #${worker.id} ${dim(`(${stream ? 'stream' : 'sync'})`)}`);
 
-    // Creates an isolated stateless chat instance
+    // Temporary chat session
     const chat = worker.client.newChat({ temporary: true });
 
     if (stream) {
@@ -357,7 +336,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
       })}\n\n`);
 
-      // If this was an OOC override, prefill the opening bracket
       const isOOC = formattedPrompt.endsWith('Assistant: [ OOC:');
       if (isOOC) {
         res.write(`data: ${JSON.stringify({
@@ -416,7 +394,6 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
         replyText = `[ OOC: ${replyText}`;
       }
 
-      // Hard cutoff for non-streaming
       replyText = replyText.split(STOP_SEQUENCE_REGEX)[0].trim();
 
       pool.releaseWorker(worker, false);
@@ -463,14 +440,14 @@ app.listen(PORT, '0.0.0.0', async () => {
   await pool.initialize();
 
   console.log(`
-  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v2.0.0 (Revamped Engine)')}
+  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v2.1.0 (Sliding Window Engine)')}
   ${dim('─'.repeat(48))}
   ${green('➜')}  ${bold('Local:')}    ${cyan(`http://127.0.0.1:${PORT}/v1`)}
   ${green('➜')}  ${bold('Network:')}  ${cyan(`http://0.0.0.0:${PORT}/v1`)}
 
-  ${dim('•')}  ${dim('Isolation:')}  Pristine Worker Teardown active
-  ${dim('•')}  ${dim('Interceptor:')} OOC Task Override + Stop-Sequence Guard
-  ${dim('•')}  ${dim('Commands:')}   ${Object.keys(COMMAND_DEFINITIONS).join(', ')}
+  ${dim('•')}  ${dim('Window:')}     Sliding context limit (${MAX_HISTORY_TURNS} turns)
+  ${dim('•')}  ${dim('Isolation:')}  Pure OOC separation (Zero transcript bleed)
+  ${dim('•')}  ${dim('Workers:')}    Stateless per-request instances
   ${dim('─'.repeat(48))}
   ${dim('ready for connections.')}
   `);
