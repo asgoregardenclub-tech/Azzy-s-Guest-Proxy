@@ -2,45 +2,44 @@ const { Gemini } = require('gemini-web-sdk');
 
 class GuestPool {
   /**
-   * @param {number} poolSize Number of guest accounts to keep active concurrently
-   * @param {number} maxRequestsPerSession Rotate account after this many requests
+   * @param {number} poolSize Number of guest sessions
+   * @param {number} maxRequestsPerWorker Recycle worker after this many turns
    */
-  constructor(poolSize = 5, maxRequestsPerSession = 25) {
+  constructor(poolSize = 5, maxRequestsPerWorker = 10) {
     this.poolSize = poolSize;
-    this.maxRequestsPerSession = maxRequestsPerSession;
+    this.maxRequestsPerWorker = maxRequestsPerWorker;
     this.workers = [];
     this.currentIndex = 0;
   }
 
   async initialize() {
-    console.log(`[GuestPool] Initializing pool with ${this.poolSize} guest sessions...`);
     for (let i = 0; i < this.poolSize; i++) {
-      this.workers.push(this._createWorker(i + 1));
+      this.workers.push(this._createNewWorker(i + 1));
     }
-    console.log(`[GuestPool] All ${this.poolSize} guest sessions are ready.`);
   }
 
-  _createWorker(id) {
+  _createNewWorker(id) {
     return {
       id,
-      client: new Gemini(), // Guest Mode (no API key or cookies needed)
+      client: new Gemini(),
       requestCount: 0,
       cooldownUntil: 0,
       isBusy: false
     };
   }
 
-  async recycleWorker(worker, reason = 'Rotation threshold reached') {
-    console.log(`[GuestPool] Cycling Worker #${worker.id} (${reason}). Spawning fresh guest session...`);
+  /**
+   * Completely destroys the worker's internal Gemini client and spawns a fresh one
+   * to guarantee zero Google-side memory bleed across turns.
+   */
+  purgeWorker(worker, reason = 'Session cleanup') {
     try {
       worker.client = new Gemini();
       worker.requestCount = 0;
       worker.cooldownUntil = 0;
       worker.isBusy = false;
-      console.log(`[GuestPool] Worker #${worker.id} successfully refreshed.`);
     } catch (err) {
-      console.error(`[GuestPool] Failed to refresh Worker #${worker.id}:`, err.message);
-      worker.cooldownUntil = Date.now() + 60000; // 1-minute safety cooldown
+      worker.cooldownUntil = Date.now() + 60000;
     }
   }
 
@@ -59,8 +58,7 @@ class GuestPool {
       attempts++;
     }
 
-    // If all are busy/cooling down, pick the one with earliest cooldown expiry or spawn temporary
-    console.warn(`[GuestPool] All workers busy or cooling down. Falling back to temporary fresh session...`);
+    // Emergency fallback: return an isolated zero-state worker
     return {
       id: 999,
       client: new Gemini(),
@@ -77,20 +75,17 @@ class GuestPool {
     worker.isBusy = false;
 
     if (hadError) {
-      const isRateLimit = errorMsg.includes('429') || errorMsg.toLowerCase().includes('quota') || errorMsg.toLowerCase().includes('exhausted');
-      const cooldownTime = isRateLimit ? 90000 : 15000; // 90s cooldown for rate limits, 15s for other errors
-      worker.cooldownUntil = Date.now() + cooldownTime;
-      console.warn(`[GuestPool] Worker #${worker.id} placed on cooldown for ${cooldownTime / 1000}s. Cycling session...`);
-      this.recycleWorker(worker, 'Error recovery');
+      const isRateLimit = errorMsg.includes('429') || errorMsg.toLowerCase().includes('quota');
+      worker.cooldownUntil = Date.now() + (isRateLimit ? 90000 : 20000);
+      this.purgeWorker(worker, 'Error recovery');
       return;
     }
 
     worker.requestCount++;
-    console.log(`[GuestPool] Worker #${worker.id} finished request (${worker.requestCount}/${this.maxRequestsPerSession}).`);
 
-    // Auto-cycle account once threshold is reached
-    if (worker.requestCount >= this.maxRequestsPerSession) {
-      this.recycleWorker(worker, 'Hit request limit');
+    // Purge every worker periodically or on threshold to prevent any tracking
+    if (worker.requestCount >= this.maxRequestsPerWorker) {
+      this.purgeWorker(worker, 'Rotation threshold');
     }
   }
 }
