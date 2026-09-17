@@ -7,24 +7,21 @@ class GuestPool {
   }
 
   async initialize() {
-    // Zero-overhead initialization
+    // Zero-overhead stateless initialization
   }
 
-  /**
-   * Spawns a 100% pristine, isolated Gemini instance with no shared cookies
-   * or session memory from previous turns.
-   */
   async acquireWorker() {
     this.currentIndex = (this.currentIndex + 1) % this.poolSize;
     return {
       id: this.currentIndex + 1,
-      client: new Gemini(), // Fresh client instance every time
+      client: new Gemini(), // Fresh client instance per turn
     };
   }
 
   releaseWorker(worker, hadError = false, errorMsg = '') {
-    // Garbage collect client instance
-    worker.client = null;
+    if (worker) {
+      worker.client = null; // Clean garbage collection
+    }
   }
 }
 
