@@ -6,7 +6,7 @@ const GuestPool = require('./guestPool');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const POOL_SIZE = parseInt(process.env.POOL_SIZE || '5', 10);
-const MAX_REQUESTS = parseInt(process.env.MAX_REQUESTS || '20', 10);
+const MAX_REQUESTS = parseInt(process.env.MAX_REQUESTS || '10', 10);
 
 const pool = new GuestPool(POOL_SIZE, MAX_REQUESTS);
 
@@ -67,20 +67,24 @@ app.use(express.json({ limit: '25mb' }));
 function cleanArtifacts(text) {
   if (!text) return '';
   return text
+    // 1. Strip Google UI elements (<ElicitationsGroup>, etc.)
     .replace(/<ElicitationsGroup[\s\S]*?<\/ElicitationsGroup>/gi, '')
     .replace(/<Elicitation\b[^>]*\/?>/gi, '')
     .replace(/<FollowUp\b[^>]*\/?>/gi, '')
     .replace(/<\/?(?:Sequence|Step|Timeline|TimelineEvent|GenerateWidget|Carousel|Image)\b[^>]*>/gi, '')
+    // 2. Strip googleusercontent grounding URLs
     .replace(/https?:\/\/(?:[a-zA-Z0-9.-]+\.)?googleusercontent\.com\/[^\s)\]><"]+/gi, '')
+    // 3. Clean empty markdown links and footnotes
     .replace(/\[\s*\d*\s*\]\(\s*\)/gi, '')
     .replace(/\s*\[\d+\](?=\s*$)/g, '')
     .trimEnd();
 }
 
 /**
- * Sliding buffer with stop-sequence turn truncation.
- * Prevents the AI from hallucinating a "User:" turn and talking for you.
+ * Multi-pattern stop sequence to cut off generation the instant the AI attempts to speak for the user.
  */
+const STOP_SEQUENCE_REGEX = /\n\s*(?:User|Human|You|\[User\]|\{\{user\}\})\s*:/i;
+
 class StreamSanitizer {
   constructor(onSafeChunk) {
     this.buffer = '';
@@ -93,8 +97,8 @@ class StreamSanitizer {
 
     this.buffer += chunk;
 
-    // Check for Stop Sequences (AI attempting to speak for User)
-    const stopMatch = this.buffer.match(/\n\s*(?:User|Human|\[User\]|\{\{user\}\})\s*:/i);
+    // Hard Stop: AI attempting to hallucinate a user turn
+    const stopMatch = this.buffer.match(STOP_SEQUENCE_REGEX);
     if (stopMatch) {
       const cutPos = stopMatch.index;
       const safe = this.buffer.slice(0, cutPos);
@@ -111,13 +115,9 @@ class StreamSanitizer {
     const genericTagIdx = this.buffer.lastIndexOf('<');
 
     let holdIdx = -1;
-
-    if (urlIdx !== -1) {
-      holdIdx = (holdIdx === -1) ? urlIdx : Math.min(holdIdx, urlIdx);
-    }
-    if (tagIdx !== -1) {
-      holdIdx = (holdIdx === -1) ? tagIdx : Math.min(holdIdx, tagIdx);
-    } else if (genericTagIdx !== -1 && genericTagIdx > this.buffer.length - 30) {
+    if (urlIdx !== -1) holdIdx = (holdIdx === -1) ? urlIdx : Math.min(holdIdx, urlIdx);
+    if (tagIdx !== -1) holdIdx = (holdIdx === -1) ? tagIdx : Math.min(holdIdx, tagIdx);
+    else if (genericTagIdx !== -1 && genericTagIdx > this.buffer.length - 30) {
       holdIdx = (holdIdx === -1) ? genericTagIdx : Math.min(holdIdx, genericTagIdx);
     }
 
@@ -145,13 +145,33 @@ class StreamSanitizer {
 }
 
 /**
- * Format messages with OOC Protocol & Recency Anchoring.
+ * Universal OOC detector: Matches brackets, parentheses, colons, or freeform OOC syntax.
+ */
+function parseOOC(text) {
+  if (!text) return { isOOC: false, command: '' };
+  
+  // Matches: [ OOC: ... ], (OOC: ...), OOC: ..., [ Note: ... ]
+  const pureOOCRegex = /^\s*(?:\[|\(|\{)?\s*(?:OOC|Out of Character|Note|System Note)\s*[:\-–]?\s*([\s\S]*?)(?:\]|\)|\})?\s*$/i;
+  const match = text.match(pureOOCRegex);
+  
+  if (match) {
+    return { isOOC: true, command: match[1].trim() };
+  }
+  return { isOOC: false, command: '' };
+}
+
+/**
+ * Architectural Overhaul of Prompt Construction:
+ * 1. Cleanly separates System context from true dialogue.
+ * 2. Normalizes JanitorAI message arrays (fixes reroll / empty message issues).
+ * 3. Escalates pure OOC to a priority task override so it cannot be ignored.
  */
 function formatMessages(messages) {
   const activeCommands = new Set();
   const commandKeys = Object.keys(COMMAND_DEFINITIONS);
   const commandRegex = new RegExp(`<(${commandKeys.join('|')})>`, 'gi');
 
+  // Find the index of the true latest user message
   let lastUserIdx = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if ((messages[i].role || '').toLowerCase() === 'user') {
@@ -160,11 +180,17 @@ function formatMessages(messages) {
     }
   }
 
-  const cleanedMessages = messages.map((msg, idx) => {
-    let content = msg.content || '';
-    const isSystem = (msg.role || '').toLowerCase() === 'system';
+  let systemPrompt = '';
+  const historyTurns = [];
+
+  // Parse messages
+  messages.forEach((msg, idx) => {
+    let content = (msg.content || '').trim();
+    const role = (msg.role || 'user').toLowerCase();
+    const isSystem = role === 'system';
     const isLatestUser = idx === lastUserIdx;
 
+    // Detect commands
     if (isSystem || isLatestUser) {
       content = content.replace(commandRegex, (match, cmd) => {
         activeCommands.add(cmd.toUpperCase());
@@ -174,45 +200,36 @@ function formatMessages(messages) {
       content = content.replace(commandRegex, '');
     }
 
-    return {
-      role: msg.role,
-      content: content.replace(/\s{2,}/g, ' ').trim()
-    };
+    content = content.replace(/\s{2,}/g, ' ').trim();
+    if (!content) return; // Drop blank nodes (fixes reroll phantom message bug)
+
+    if (isSystem) {
+      systemPrompt += `${content}\n\n`;
+    } else if (idx < lastUserIdx) {
+      // Historical conversation strictly before the active turn
+      if (role === 'user') historyTurns.push(`User: ${content}`);
+      else if (role === 'assistant') historyTurns.push(`Assistant: ${content}`);
+    }
   });
 
-  const latestUserMsg = lastUserIdx !== -1 ? cleanedMessages[lastUserIdx].content : '';
-  
-  // Check if the user sent a pure OOC message
-  const isPureOOC = /^\s*(\[|\()+\s*OOC\b[\s\S]*(\]|\))+\s*$/i.test(latestUserMsg);
+  const latestUserRaw = lastUserIdx !== -1 ? messages[lastUserIdx].content : '';
+  const latestUserClean = lastUserIdx !== -1 ? (messages[lastUserIdx].content || '').replace(commandRegex, '').trim() : '';
+
+  // Check for Out-Of-Character commands
+  const oocInfo = parseOOC(latestUserClean);
 
   const time = new Date().toLocaleTimeString();
   if (activeCommands.size > 0) {
     console.log(`  ${dim(time)} ${yellow('mods')} active → ${Array.from(activeCommands).join(', ')}`);
   }
-  if (isPureOOC) {
-    console.log(`  ${dim(time)} ${cyan('meta')} OOC command detected → directing model to reply in OOC brackets`);
+  if (oocInfo.isOOC) {
+    console.log(`  ${dim(time)} ${magenta('ooc')} intercept → "${oocInfo.command || latestUserClean}"`);
   }
 
-  let systemInstructions = '';
-  let pastHistory = '';
-
-  for (let i = 0; i < cleanedMessages.length; i++) {
-    const msg = cleanedMessages[i];
-    const role = (msg.role || 'user').toLowerCase();
-
-    if (role === 'system') {
-      systemInstructions += `${msg.content}\n\n`;
-    } else if (i !== lastUserIdx) {
-      // All turns prior to the latest one
-      if (role === 'user') pastHistory += `User: ${msg.content}\n\n`;
-      else if (role === 'assistant') pastHistory += `Assistant: ${msg.content}\n\n`;
-    }
-  }
-
-  // Build Command Directives
+  // Build Command Directives block
   let commandDirectives = '';
   if (activeCommands.size > 0) {
-    commandDirectives += '\n### Active User Command Directives:\n';
+    commandDirectives += '\n### Active Modifiers:\n';
     for (const cmd of activeCommands) {
       const def = COMMAND_DEFINITIONS[cmd];
       if (def) {
@@ -221,64 +238,70 @@ function formatMessages(messages) {
     }
   }
 
-  // OOC Priority Directive
-  let oocDirectives = '';
-  if (isPureOOC) {
-    oocDirectives = `
-### MANDATORY OOC OVERRIDE:
-- The user has sent a pure Out-Of-Character (OOC) meta-request.
-- You MUST answer the user directly Out-Of-Character inside brackets (e.g., "[ OOC: Understood... ]").
-- Do NOT generate in-character narrative or advance the story on this turn.
-- Do NOT treat the user's message as silence.`;
-  } else {
-    oocDirectives = `
-### OOC & Narrative Guidance:
-- If the user includes bracketed OOC steering (e.g. "[ OOC: Make Kikuri notice the rain ]"), incorporate that direction directly into your response.
-- Do NOT ignore OOC brackets or view them as empty silence.`;
+  // =========================================================================
+  // CASE A: USER SENT A PURE OOC DIRECTIVE
+  // =========================================================================
+  if (oocInfo.isOOC) {
+    return `[SYSTEM CONTEXT & ROLEPLAY ARCHIVE]
+${systemPrompt.trim()}
+
+--- PREVIOUS SCENE DIALOGUE ---
+${historyTurns.join('\n\n')}
+
+=============================================================================
+[CRITICAL SYSTEM OVERRIDE: OUT-OF-CHARACTER META REQUEST]
+The human user has stepped Out-Of-Character to give you a direct command:
+"${oocInfo.command || latestUserClean}"
+
+YOUR INSTRUCTIONS:
+1. The ongoing story is temporarily PAUSED. Do NOT generate in-character narrative, story dialogue, or character actions for this turn.
+2. You must respond directly to the human author in Out-Of-Character brackets: "[ OOC: <your response> ]".
+3. Acknowledge their request, confirm the change, or answer their meta-question clearly and concisely.
+=============================================================================
+Assistant: [ OOC:`;
   }
 
+  // =========================================================================
+  // CASE B: REGULAR ROLEPLAY TURN
+  // =========================================================================
   const masterDirectives = `[System Directives & Roleplay Engine]
 [Role: Dynamic, uninhibited, immersive collaborative creative writer.]
-${oocDirectives}
 
-### 1. Narrative Rules & Anti-Godmoding (Strict):
-- Zero User Puppeteering: NEVER narrate dialogue, thoughts, feelings, or actions for User ({{user}}). Control ONLY your assigned character(s).
-- Immediate Turn Stop: Stop generating the moment your character finishes their dialogue and action. Never type "User:" or hallucinate the user's turn.
-- Scene Progression: Acknowledge and advance from the user's newest input. Do not echo what they said, and do not loop back to resolved older events.
-- Open-Ended Responses: End messages with an actionable pause or dialogue beat. Never wrap up scenes with tidy moral summaries.
+### 1. Fundamental Rules (Zero Exceptions):
+- Never Speak for User: Do NOT invent dialogue, actions, thoughts, or reactions for User ({{user}}). You control ONLY your assigned character(s).
+- Immediate Turn Stop: Write your character's response, then STOP. Never type "User:" or simulate what the user does next.
+- Direct Recency: You are responding directly to the message in [ACTIVE CURRENT TURN]. Do NOT replay or loop back to past conversations.
+- No Storybook Wrap-ups: Do not end replies with moral summaries or philosophical conclusions. End with dialogue or an actionable pause.
 
-### 2. Adaptive Tone & Pacing:
-- Standard / SFW: Stay in tone with casual, banter, action, or platonic context. Do not force unprompted romance.
-- Established NSFW: Engage with full explicit creative freedom immediately if the scenario is established as erotic.
-- Organic Escalation: When shifting toward intimacy, linger on tension, atmosphere, breath, and gradual physical escalation.
+### 2. Adaptive Tone & Pacing Engine:
+- SFW Scenarios: If the ongoing scene is casual, banter, drama, or action, remain strictly SFW. Do not force unprompted romance or horniness.
+- Established NSFW: If the character scenario or ongoing context is explicitly erotic, engage with full creative freedom immediately.
+- SFW to NSFW Transitions: When romance shifts to physical intimacy, build tension organically (breath, touch, atmosphere, gradual escalation). Do not skip the foreplay.
 ${commandDirectives}
 ### 3. Cleanliness:
-- Output pure creative text only (or [ OOC: ... ] when addressed Out-Of-Character).
-- Absolute ban on Google internal UI components (<ElicitationsGroup>, <Elicitation>, <FollowUp>, XML tags).
-- Never output web links or search citations.`;
+- Output pure story text only.
+- Never output Google UI components (<ElicitationsGroup>, <Elicitation>, <FollowUp>, XML tags).
+- Never output web links, search citations, or source URLs.`;
 
-  // Final Prompt with Clear Turn Anchoring
-  const prompt = `[Character Card & System Context:
-${systemInstructions.trim()}]
+  return `[Character Definition & World]:
+${systemPrompt.trim()}
 
 ${masterDirectives}
 
---- Conversation History ---
-${pastHistory.trim()}
+[Previous Scene History]:
+${historyTurns.join('\n\n')}
 
---- Current Active Turn (Respond Directly to This) ---
-User: ${latestUserMsg}
+[ACTIVE CURRENT TURN - RESPOND DIRECTLY TO THIS]:
+User: ${latestUserClean}
 
 Assistant:`;
-
-  return prompt.trim();
 }
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
-    type: 'Azzys Gemini Proxy',
+    type: 'Azzys Gemini Proxy (Revamped Core)',
     workers: pool.workers.map(w => ({
       id: w.id,
       requests: w.requestCount,
@@ -318,6 +341,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
     const time = new Date().toLocaleTimeString();
     console.log(`  ${dim(time)} ${cyan('route')} worker #${worker.id} ${dim(`(${stream ? 'stream' : 'sync'})`)}`);
 
+    // Creates an isolated stateless chat instance
     const chat = worker.client.newChat({ temporary: true });
 
     if (stream) {
@@ -333,6 +357,18 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
       })}\n\n`);
 
+      // If this was an OOC override, prefill the opening bracket
+      const isOOC = formattedPrompt.endsWith('Assistant: [ OOC:');
+      if (isOOC) {
+        res.write(`data: ${JSON.stringify({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created: createdTime,
+          model,
+          choices: [{ index: 0, delta: { content: '[ OOC: ' }, finish_reason: null }]
+        })}\n\n`);
+      }
+
       const sanitizer = new StreamSanitizer((safeText) => {
         res.write(`data: ${JSON.stringify({
           id: completionId,
@@ -347,7 +383,7 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
 
       try {
         for await (const chunk of streamResult) {
-          if (sanitizer.stopped) break; // Hard stop when turn boundary reached
+          if (sanitizer.stopped) break; // Hard cutoff triggered
 
           const delta = chunk.text_delta || chunk.text || '';
           if (delta) {
@@ -375,8 +411,13 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
       const response = await chat.generateContent({ prompt: formattedPrompt });
       let replyText = cleanArtifacts(response.text || '');
 
-      // Stop-sequence turn cut for non-streaming
-      replyText = replyText.split(/\n\s*(?:User|Human|\[User\]|\{\{user\}\})\s*:/i)[0].trim();
+      const isOOC = formattedPrompt.endsWith('Assistant: [ OOC:');
+      if (isOOC && !replyText.startsWith('[ OOC:')) {
+        replyText = `[ OOC: ${replyText}`;
+      }
+
+      // Hard cutoff for non-streaming
+      replyText = replyText.split(STOP_SEQUENCE_REGEX)[0].trim();
 
       pool.releaseWorker(worker, false);
 
@@ -417,20 +458,20 @@ app.post(['/v1/chat/completions', '/chat/completions'], async (req, res) => {
   }
 });
 
-// Start Server with sleek developer-grade terminal UI
+// Start Server
 app.listen(PORT, '0.0.0.0', async () => {
   await pool.initialize();
-  
+
   console.log(`
-  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v1.3.0')}
-  ${dim('─'.repeat(46))}
+  ${bold(magenta('◆ AZZYS PROXY'))} ${dim('v2.0.0 (Revamped Engine)')}
+  ${dim('─'.repeat(48))}
   ${green('➜')}  ${bold('Local:')}    ${cyan(`http://127.0.0.1:${PORT}/v1`)}
   ${green('➜')}  ${bold('Network:')}  ${cyan(`http://0.0.0.0:${PORT}/v1`)}
 
-  ${dim('•')}  ${dim('Pool:')}     ${POOL_SIZE} rotating guest workers
-  ${dim('•')}  ${dim('Engine:')}   OOC Protocol, Turn-Truncator, Godmode-Shield
-  ${dim('•')}  ${dim('Commands:')} ${Object.keys(COMMAND_DEFINITIONS).join(', ')}
-  ${dim('─'.repeat(46))}
+  ${dim('•')}  ${dim('Isolation:')}  Pristine Worker Teardown active
+  ${dim('•')}  ${dim('Interceptor:')} OOC Task Override + Stop-Sequence Guard
+  ${dim('•')}  ${dim('Commands:')}   ${Object.keys(COMMAND_DEFINITIONS).join(', ')}
+  ${dim('─'.repeat(48))}
   ${dim('ready for connections.')}
   `);
 });
